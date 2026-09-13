@@ -1205,19 +1205,27 @@ html[dir="rtl"] #connect .hop .who{font-family:var(--ar-body);letter-spacing:0;t
    CSS variables. Literal values plus !important cannot be reached
    that way, so the page stays light wherever it is opened. */
 html{color-scheme:only light !important;background:#FCFCFB !important;background-color:#FCFCFB !important}
-body{background:#FCFCFB !important;background-color:#FCFCFB !important;color:#0E0F11 !important;-webkit-text-fill-color:#0E0F11}
+body{background:#FCFCFB !important;background-color:#FCFCFB !important;color:#0E0F11 !important}
 @media (prefers-color-scheme:dark){
   :root{color-scheme:only light !important}
-  html,body{background:#FCFCFB !important;background-color:#FCFCFB !important;color:#0E0F11 !important;-webkit-text-fill-color:#0E0F11}
+  html,body{background:#FCFCFB !important;background-color:#FCFCFB !important;color:#0E0F11 !important}
 }
 @media (prefers-color-scheme:dark){
   .nav,.plan,.sheet,#connect .cn-step,#connect .hop .mk{background:#FFFFFF !important}
-  .ser,h1,h2,h3,h4{color:#0E0F11 !important;-webkit-text-fill-color:#0E0F11}
-  .lede,.hop p,.cn-step p{color:#6A6C71 !important;-webkit-text-fill-color:#6A6C71}
+  .ser,h1,h2,h3,h4{color:#0E0F11 !important}
+  .lede,.hop p,.cn-step p{color:#6A6C71 !important}
+  .langsel button[aria-pressed="true"]{color:#FFFFFF !important}
+  .langsel .thumb{background:#0E0F11 !important}
   .btn,.cycswitch button[aria-pressed="true"],.cyc button[aria-pressed="true"],
   #connect .dirsw button[aria-pressed="true"],#connect .playbtn,#connect .hop.lit .mk{
-    background:#0E0F11 !important;color:#FFFFFF !important;-webkit-text-fill-color:#FFFFFF}
+    background:#0E0F11 !important;color:#FFFFFF !important}
 }
+
+/* Text fill must follow each element's own colour. Setting it to a fixed value
+   on body inherits everywhere and repaints light text on dark buttons black,
+   which is invisible. currentColor keeps the forced-dark protection without
+   that side effect. */
+*,*::before,*::after{-webkit-text-fill-color:currentColor}
 </style>
 </head>
 <body>
