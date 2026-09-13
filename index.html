@@ -187,8 +187,8 @@ html[dir="rtl"] .sec-mark .ttl{font-family:var(--ar-body);letter-spacing:0;font-
 .nav-right{margin-inline-start:auto;display:flex;align-items:center;gap:.8rem}
 
 /* language selector — three-state rail */
-.langsel{display:flex;position:relative;border:1px solid var(--rule);border-radius:999px;padding:3px;background:color-mix(in srgb,var(--bone-hi) 60%,transparent)}
-.langsel .thumb{position:absolute;top:3px;bottom:3px;border-radius:999px;background:var(--ink);
+.langsel{display:flex;flex:none;position:relative;border:1px solid var(--rule);border-radius:999px;padding:3px;background:color-mix(in srgb,var(--bone-hi) 60%,transparent)}
+.langsel .thumb{position:absolute;top:3px;bottom:3px;left:0;border-radius:999px;background:var(--ink);
   transition:transform .48s var(--ease-out),width .48s var(--ease-out);z-index:0}
 
 .langsel button{position:relative;z-index:1;padding:.32rem .78rem;border-radius:999px;
@@ -2723,7 +2723,7 @@ function applyLang(l){
   });
 
   $$("[data-setlang]").forEach(b=> b.setAttribute("aria-pressed", String(b.dataset.setlang===l)));
-  moveThumb();
+  syncThumb();
   setState(state.st);
   renderPhrases();
   if($("#transcript") && !$("#transcript").querySelector(".turn")){ $("#transcript").innerHTML=""; trIdle(); }
@@ -2743,10 +2743,20 @@ function moveThumb(){
   const rail = $(".langsel"), thumb = $("#langThumb");
   const act = $('.langsel button[aria-pressed="true"]');
   if(!act||!thumb||!rail) return;
+  /* getBoundingClientRect is always physical, and the thumb is anchored at
+     left:0, so this one calculation is correct in both LTR and RTL. */
   const r = rail.getBoundingClientRect(), a = act.getBoundingClientRect();
+  if(!a.width) return;                       // not laid out yet; a later call will catch it
   thumb.style.width = a.width+"px";
   thumb.style.transform = `translateX(${a.left - r.left - 3}px)`;
 }
+/* The rail changes width when the direction flips and again when the Arabic
+   fonts finish loading, so one call at switch time is not enough. */
+function syncThumb(){ requestAnimationFrame(()=>requestAnimationFrame(moveThumb)); }
+addEventListener("resize", syncThumb, {passive:true});
+addEventListener("orientationchange", syncThumb);
+if(document.fonts && document.fonts.ready) document.fonts.ready.then(syncThumb);
+addEventListener("load", syncThumb);
 
 /* ============================================================== AUDIO ==== */
 let ac=null, analyser=null, micStream=null, freqData=null, timeData=null, level=0;

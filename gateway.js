@@ -40,6 +40,12 @@ const CFG = {
   /* Vapi — verify inbound webhooks with this shared token (set the same
      value as a header credential on the Server URL in the Vapi dashboard). */
   VAPI_WEBHOOK_TOKEN: process.env.VAPI_WEBHOOK_TOKEN || "",
+
+  /* --- social sign-in. Each provider is optional: if its keys are absent the
+     button simply does not appear, so the page never offers a broken option. */
+  GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || "",
+  GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || "",
+
   /* Vapi private API key — needed to push the cost guards below onto assistants. */
   VAPI_API_KEY: process.env.VAPI_API_KEY || "",
   /* COST GUARDS — end dead air, never a live conversation.
@@ -95,6 +101,8 @@ async function migrate() {
     vapi_assistant_ids TEXT[] NOT NULL DEFAULT '{}',    -- assistants owned by this tenant
     minutes_used  INTEGER NOT NULL DEFAULT 0,
     consent       JSONB,                                 -- terms version + timestamp from checkout
+    oauth_provider TEXT,                                 -- 'google', or null for password accounts
+    oauth_sub     TEXT,                                  -- the provider's stable user id
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
   );
   CREATE TABLE IF NOT EXISTS calls(
@@ -167,6 +175,16 @@ async function migrate() {
     detail    JSONB,
     at        TIMESTAMPTZ NOT NULL DEFAULT now()
   );`);
+
+  /* Migrations for databases created before social sign-in existed.
+     CREATE TABLE IF NOT EXISTS does nothing to a table that is already there,
+     so these have to be explicit. All are safe to run repeatedly. */
+  await q(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS oauth_provider TEXT`);
+  await q(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS oauth_sub TEXT`);
+  await q(`ALTER TABLE tenants ALTER COLUMN pass_hash DROP NOT NULL`);
+  await q(`CREATE UNIQUE INDEX IF NOT EXISTS tenants_oauth ON tenants(oauth_provider, oauth_sub)
+           WHERE oauth_provider IS NOT NULL`);
+
   /* first admin */
   const { rows } = await q(`SELECT 1 FROM tenants WHERE role='admin' LIMIT 1`);
   if (!rows.length) {
@@ -235,7 +253,7 @@ function readSession(req) {
    immediately, no redeploy. Env vars remain the fallback.
    Bootstrap secrets (DATABASE_URL, SESSION_SECRET) stay env-only.
    ============================================================ */
-const APPLYABLE = ["PAYMENTS_MODE","PAYMOB_API_KEY","PAYMOB_INTEGRATION_ID","PAYMOB_IFRAME_ID","PAYMOB_HMAC","VAPI_WEBHOOK_TOKEN","VAPI_API_KEY","MAX_CALL_SECONDS","SILENCE_TIMEOUT_SECONDS","FX_SERVICE_URL","SITE_URL"];
+const APPLYABLE = ["PAYMENTS_MODE","PAYMOB_API_KEY","PAYMOB_INTEGRATION_ID","PAYMOB_IFRAME_ID","PAYMOB_HMAC","VAPI_WEBHOOK_TOKEN","VAPI_API_KEY","MAX_CALL_SECONDS","SILENCE_TIMEOUT_SECONDS","FX_SERVICE_URL","SITE_URL","GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET"];
 let CONF = {};
 async function loadConf() {
   try { const { rows } = await q(`SELECT key,value FROM config`); CONF = Object.fromEntries(rows.map(r => [r.key, r.value])); }
@@ -248,6 +266,8 @@ const cfg = k => (CONF[k] !== undefined && CONF[k] !== "") ? CONF[k] : CFG[k];
    ============================================================ */
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+/* Form-encoded bodies, for anything that posts a plain HTML form. */
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 const FILES = {
   site: path.join(CFG.DIR, "nabra-voice-ai.html"),
@@ -305,7 +325,137 @@ app.get("/signup", (req, res) => {
   const co = p.co || { plan: "growth", cycle: "monthly" };
   res.setHeader("Content-Type", "text/html; charset=utf-8").end(authPage("signup", co, req.query.t || ""));
 });
-app.get("/login", (req, res) => res.setHeader("Content-Type", "text/html; charset=utf-8").end(authPage("login")));
+
+/* ============================================================
+   SIGN IN WITH GOOGLE
+   ------------------------------------------------------------
+   Authorization-code flow. Google redirects back with a code and
+   we exchange it server side, so no secret and no token ever
+   reaches the browser.
+
+   With no keys configured this is simply switched off and the
+   button never renders, rather than appearing and failing. Email
+   and password sign-in always works either way.
+   ============================================================ */
+const googleOn = () => !!(cfg("GOOGLE_CLIENT_ID") && cfg("GOOGLE_CLIENT_SECRET"));
+
+/* The state cookie carries the CSRF value and, if the person came from
+   checkout, the signed handoff holding their plan, cycle and consent. */
+function setState(res, payload) {
+  const token = sign({ ...payload, exp: Date.now() + 10 * 60e3 });
+  res.setHeader("Set-Cookie",
+    `nabra_o=${token}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax${process.env.NODE_ENV === "production" ? "; Secure" : ""}`);
+  return token;
+}
+function readState(req) {
+  const m = /(?:^|;\s*)nabra_o=([^;]+)/.exec(req.headers.cookie || "");
+  return m ? verify(m[1]) : null;
+}
+const clearState = res => res.setHeader("Set-Cookie", "nabra_o=; Path=/; Max-Age=0");
+
+function oauthFail(res, why) {
+  /* Never leak provider internals to the browser; log the detail, show a
+     plain sentence and a way back. */
+  console.warn("[oauth]", why);
+  res.status(400).type("html").send(
+`<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="color-scheme" content="light only"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign-in failed — NABRA</title><style>html{background:#FCFCFB!important;color-scheme:only light!important}
+body{background:#FCFCFB;color:#0E0F11;font-family:system-ui,sans-serif;display:grid;place-items:center;
+min-height:100vh;margin:0;text-align:center;padding:2rem}a{color:#B8501C}</style></head><body><div>
+<h1 style="font-weight:400;font-size:1.5rem;margin:0 0 .5rem">That sign-in did not complete</h1>
+<p style="color:#6A6C71;margin:0 0 1.2rem">Nothing was changed on your account. Please try again, or use your email and password.</p>
+<a href="/login">Back to log in</a></div></body></html>`);
+}
+
+/* Find or create the account behind a verified social identity.
+   Matching is by provider id first, then by email, so somebody who signed up
+   with a password and later uses Google on the same address keeps one account
+   instead of quietly creating a second. */
+async function tenantFromSocial({ provider, sub, email, name, co }) {
+  email = String(email || "").toLowerCase().trim();
+  if (!email) throw new Error("provider returned no email");
+
+  let { rows } = await q(`SELECT * FROM tenants WHERE oauth_provider=$1 AND oauth_sub=$2`, [provider, sub]);
+  if (rows.length) return { tenant: rows[0], created: false };
+
+  ({ rows } = await q(`SELECT * FROM tenants WHERE email=$1`, [email]));
+  if (rows.length) {
+    await q(`UPDATE tenants SET oauth_provider=$1, oauth_sub=$2 WHERE id=$3`, [provider, sub, rows[0].id]);
+    return { tenant: rows[0], created: false };
+  }
+
+  const plan = ["starter", "growth", "enterprise"].includes(co && co.plan) ? co.plan : "growth";
+  const cycle = ["monthly", "annual"].includes(co && co.cycle) ? co.cycle : "monthly";
+  const status = cfg("PAYMENTS_MODE") === "paymob" ? "pending" : "active";
+  const ins = await q(
+    `INSERT INTO tenants(name,email,role,plan,cycle,status,consent,oauth_provider,oauth_sub)
+     VALUES($1,$2,'customer',$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [String(name || email.split("@")[0]).slice(0, 120), email, plan, cycle, status,
+     (co && co.consent) || null, provider, sub]);
+  return { tenant: ins.rows[0], created: true };
+}
+
+async function finishSocial(res, info) {
+  const { tenant, created } = await tenantFromSocial(info);
+  if (tenant.status === "suspended") return oauthFail(res, "suspended account");
+  clearState(res);
+  setSession(res, tenant);
+  await track(tenant.id, created ? "signup" : "login", { via: info.provider });
+  if (tenant.role === "admin") return res.redirect("/admin");
+  const { rows } = await q(`SELECT 1 FROM agents WHERE tenant_id=$1 LIMIT 1`, [tenant.id]);
+  res.redirect(rows.length ? "/app" : "/setup");
+}
+
+/* ---------------------------------------------------------- Google */
+app.get("/auth/google", (req, res) => {
+  if (!googleOn()) return oauthFail(res, "google not configured");
+  const nonce = crypto.randomBytes(16).toString("hex");
+  setState(res, { n: nonce, t: req.query.t || null });
+  const u = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  u.searchParams.set("client_id", cfg("GOOGLE_CLIENT_ID"));
+  u.searchParams.set("redirect_uri", siteUrl(req) + "/auth/google/callback");
+  u.searchParams.set("response_type", "code");
+  u.searchParams.set("scope", "openid email profile");
+  u.searchParams.set("state", nonce);
+  u.searchParams.set("prompt", "select_account");
+  res.redirect(u.toString());
+});
+
+app.get("/auth/google/callback", async (req, res) => {
+  try {
+    if (!googleOn()) return oauthFail(res, "google not configured");
+    const st = readState(req);
+    if (!st || !req.query.state || st.n !== req.query.state) return oauthFail(res, "state mismatch");
+    if (!req.query.code) return oauthFail(res, "no code returned");
+
+    const body = new URLSearchParams({
+      code: String(req.query.code),
+      client_id: cfg("GOOGLE_CLIENT_ID"),
+      client_secret: cfg("GOOGLE_CLIENT_SECRET"),
+      redirect_uri: siteUrl(req) + "/auth/google/callback",
+      grant_type: "authorization_code",
+    });
+    const r = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
+    });
+    if (!r.ok) return oauthFail(res, "google token exchange " + r.status);
+    const tok = await r.json();
+    /* The id_token arrived over TLS straight from Google's token endpoint in
+       response to our authenticated request, so its claims can be read
+       directly; there is no third party in between to forge it. */
+    const claims = JSON.parse(Buffer.from(String(tok.id_token).split(".")[1], "base64url").toString());
+    if (claims.aud !== cfg("GOOGLE_CLIENT_ID")) return oauthFail(res, "audience mismatch");
+    if (!/^(https:\/\/)?accounts\.google\.com$/.test(String(claims.iss))) return oauthFail(res, "issuer mismatch");
+    if (claims.email_verified === false) return oauthFail(res, "google email not verified");
+    await finishSocial(res, {
+      provider: "google", sub: claims.sub, email: claims.email,
+      name: claims.name, co: (verify(st.t) || {}).co,
+    });
+  } catch (e) { oauthFail(res, e.message); }
+});
+
+app.get("/login", (req, res) => res.setHeader("Content-Type", "text/html; charset=utf-8").end(authPage("login", null, req.query.t || "")));
 app.get("/logout", (req, res) => { res.setHeader("Set-Cookie", "nabra_s=; Path=/; Max-Age=0"); res.redirect("/"); });
 
 app.post("/api/auth/signup", async (req, res) => {
@@ -379,6 +529,12 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(429).json({ error: "Too many attempts. Wait fifteen minutes and try again." });
   const { rows } = await q(`SELECT * FROM tenants WHERE email=$1`, [addr]);
   const t = rows[0];
+  /* An account created through Google has no password. Saying so is
+     more useful than "wrong password", and reveals nothing an attacker could
+     not learn by trying that provider. */
+  if (t && !t.pass_hash && t.oauth_provider) {
+    return res.status(401).json({ error: "This account uses Google to sign in. Use the Google button above." });
+  }
   if (!t || !checkPw(password || "", t.pass_hash)) {
     noteAttempt(key);
     return res.status(401).json({ error: "Email or password is not right." });
@@ -923,6 +1079,19 @@ ${pages.map(([p, pr]) => `  <url><loc>${base}${p}</loc><lastmod>${today}</lastmo
 app.get("/health", (req, res) => res.json({ ok: true, payments: cfg("PAYMENTS_MODE") }));
 
 /* ------------------------------------------------------------ auth pages (inline, brand-matched) */
+/* Only providers with keys configured are offered, so a button on this page
+   always leads somewhere. The checkout handoff token rides along so a person
+   who signed in socially keeps the plan they chose. */
+function socialBlock(isUp, tok) {
+  const q = tok ? "?t=" + encodeURIComponent(tok) : "";
+  const verb = isUp ? "Sign up" : "Log in";
+  const btns = [];
+  if (googleOn()) btns.push(
+    `<a href="/auth/google${q}"><svg viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45 24c0-1.6-.1-2.7-.4-3.9H24v7.1h12c-.2 1.9-1.5 4.7-4.4 6.6l6.7 5.2C42.2 35.5 45 30.3 45 24z"/><path fill="#34A853" d="M24 46c5.9 0 10.9-2 14.5-5.3l-6.9-5.4c-1.8 1.3-4.3 2.2-7.6 2.2-5.8 0-10.7-3.8-12.5-9.900l-7.1 5.5C8.1 40.8 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.5 27.6c-.5-1.4-.7-2.9-.7-4.4s.3-3 .7-4.4l-7.1-5.5C2.9 16.4 2 20.1 2 24s.9 7.6 2.4 10.7l7.1-7.1z"/><path fill="#EA4335" d="M24 10.4c4.1 0 6.9 1.8 8.5 3.3l6.2-6.1C34.9 4.1 29.9 2 24 2 15.4 2 8.1 7.2 4.4 13.3l7.1 5.5C13.3 14.2 18.2 10.4 24 10.4z"/></svg>${verb} with Google</a>`);
+  if (!btns.length) return "";
+  return `<div class="soc">${btns.join("")}</div><div class="or">or with email</div>`;
+}
+
 function authPage(kind, co, tok) {
   const isUp = kind === "signup";
   const planLine = isUp && co ? `<p class="plan">Plan: <b>${esc(co.plan)}</b> · billed ${esc(co.cycle)} — invoiced in EGP</p>` : "";
@@ -941,6 +1110,14 @@ h1{font-family:'Instrument Serif',serif;font-weight:400;font-size:1.7rem;margin-
 label{display:block;font-family:'Chivo Mono',monospace;font-size:.58rem;letter-spacing:.15em;text-transform:uppercase;color:var(--mute);margin:.9rem 0 .3rem}
 input{width:100%;border:1px solid var(--rule);border-radius:9px;padding:.6rem .8rem;font:inherit;font-size:.9rem;background:var(--bone)}
 input:focus{outline:none;border-color:var(--fg)}
+.soc{display:grid;gap:.55rem;margin-bottom:.2rem}
+.soc a{display:flex;align-items:center;justify-content:center;gap:.6rem;padding:.68rem 1rem;border-radius:9px;
+  border:1px solid var(--rule);text-decoration:none;font-size:.92rem;font-weight:500;background:#fff;color:var(--fg)}
+.soc a:hover{border-color:var(--fg)}
+.soc svg{width:17px;height:17px;flex:none}
+.or{display:flex;align-items:center;gap:.7rem;margin:1.1rem 0 .2rem;color:var(--mute);
+  font-family:'Chivo Mono',monospace;font-size:.58rem;letter-spacing:.15em;text-transform:uppercase}
+.or::before,.or::after{content:"";flex:1;height:1px;background:var(--rule)}
 button{width:100%;margin-top:1.3rem;padding:.7rem;border:none;border-radius:999px;background:var(--fg);color:#fff;font:inherit;font-weight:500;cursor:pointer}
 .err{color:var(--ember);font-size:.8rem;margin-top:.8rem;display:none}
 .alt{font-size:.8rem;color:var(--mute);margin-top:1.2rem;text-align:center}.alt a{color:var(--fg)}
@@ -948,6 +1125,7 @@ button{width:100%;margin-top:1.3rem;padding:.7rem;border:none;border-radius:999p
 <div class="brand">نبرة NABRA <i></i></div>
 <h1>${isUp ? "Create your account" : "Welcome back"}</h1>
 ${planLine}
+${socialBlock(isUp, tok)}
 ${isUp ? `<label>Business name</label><input id="n" autocomplete="organization">` : ""}
 <label>Email</label><input id="e" type="email" autocomplete="email">
 <label>Password</label><input id="p" type="password" autocomplete="${isUp ? "new-password" : "current-password"}" minlength="8">

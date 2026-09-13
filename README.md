@@ -74,6 +74,28 @@ secret and HMAC respectively.
 
 ---
 
+## Sign-in
+
+Two ways in:
+
+| Method | Needs | If not configured |
+|---|---|---|
+| Email and password | Nothing | Always available |
+| Google | `GOOGLE_CLIENT_ID` + secret | Button does not render |
+
+Google uses the authorization-code flow: the browser never sees a token or a
+secret, and the code is exchanged server side over TLS. Accounts are matched by
+Google id first and then by email, so someone who signs up with a password and
+later uses Google on the same address keeps **one** account rather than
+creating a second. Trying a password on a Google-created account returns a
+message saying to use the Google button.
+
+Redirect URI to register in Google Cloud Console:
+
+```
+https://YOURDOMAIN/auth/google/callback
+```
+
 ## Environment
 
 See `.env.example`. Four things are load-bearing and easy to get wrong:
